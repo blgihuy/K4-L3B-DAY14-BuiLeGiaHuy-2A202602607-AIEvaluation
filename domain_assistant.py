@@ -21,7 +21,19 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from dotenv import load_dotenv
-from openai import OpenAI, OpenAIError
+
+try:
+    from google import genai
+    from google.genai import types
+except ImportError:
+    genai = None
+    types = None
+
+try:
+    from openai import OpenAI, OpenAIError
+except ImportError:
+    OpenAI = None
+    OpenAIError = Exception
 
 load_dotenv(Path(__file__).resolve().with_name(".env"))
 
@@ -242,6 +254,52 @@ class TextGenerator(Protocol):
     def generate(self, prompt: str) -> str: ...
 
 
+class GeminiGenerator:
+    """Generates answers using Google Gemini models via google-genai SDK."""
+
+    def __init__(self, max_output_tokens: int = 300) -> None:
+        api_key = (
+            os.getenv("GEMINI_API_KEY", "").strip()
+            or os.getenv("GOOGLE_API_KEY", "").strip()
+        )
+        self.model = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite").strip()
+        if not api_key or api_key == "your_gemini_api_key_here":
+            raise RuntimeError("GEMINI_API_KEY is missing from .env")
+        if not self.model:
+            raise RuntimeError("GEMINI_MODEL is missing from .env")
+        if genai is None:
+            raise RuntimeError("google-genai is not installed. Run: pip install google-genai")
+        self.client = genai.Client(api_key=api_key)
+        self.max_output_tokens = max_output_tokens
+
+    def generate(self, prompt: str) -> str:
+        config = types.GenerateContentConfig(
+            temperature=0.0,
+            max_output_tokens=self.max_output_tokens,
+        )
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                response = self.client.models.generate_content(
+                    model=self.model,
+                    contents=prompt,
+                    config=config,
+                )
+                answer = (response.text or "").strip()
+                if not answer:
+                    raise RuntimeError("Gemini returned an empty answer")
+                time.sleep(4)
+                return answer
+            except Exception as exc:
+                err_str = str(exc)
+                if ("429" in err_str or "RESOURCE_EXHAUSTED" in err_str) and attempt < max_retries - 1:
+                    print(f"Rate limited (429). Sleeping 20s before retry {attempt + 1}/{max_retries}...", flush=True)
+                    time.sleep(20)
+                    continue
+                raise RuntimeError(f"Gemini API error: {exc}") from exc
+        raise RuntimeError("Gemini generation failed after max retries")
+
+
 class OpenAIGenerator:
     def __init__(self, max_output_tokens: int = 300) -> None:
         api_key = os.getenv("OPENAI_API_KEY", "").strip()
@@ -250,6 +308,8 @@ class OpenAIGenerator:
             raise RuntimeError("OPENAI_API_KEY is missing from .env")
         if not self.model:
             raise RuntimeError("OPENAI_MODEL is missing from .env")
+        if OpenAI is None:
+            raise RuntimeError("openai is not installed")
         self.client = OpenAI(api_key=api_key)
         self.max_output_tokens = max_output_tokens
 
@@ -296,10 +356,26 @@ class DomainAssistant:
         top_k: int = 5,
     ) -> DomainAssistant:
         corpus_id, chunks = load_corpus(corpus_dir)
+        if generator is None:
+            gemini_key = (
+                os.getenv("GEMINI_API_KEY", "").strip()
+                or os.getenv("GOOGLE_API_KEY", "").strip()
+            )
+            openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+            if gemini_key and gemini_key != "your_gemini_api_key_here":
+                generator = GeminiGenerator()
+            elif (
+                openai_key
+                and not openai_key.startswith("your_")
+                and not openai_key.startswith("sk-abcdef")
+            ):
+                generator = OpenAIGenerator()
+            else:
+                generator = GeminiGenerator()
         return cls(
             corpus_id,
             BM25Retriever(chunks),
-            generator if generator is not None else OpenAIGenerator(),
+            generator,
             top_k,
         )
 
@@ -508,7 +584,7 @@ def main() -> int:
             json.dumps(artifact, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
-    except (OSError, OpenAIError, TypeError, ValueError, RuntimeError) as exc:
+    except (OSError, TypeError, ValueError, RuntimeError, Exception) as exc:
         print(f"ERROR: {exc}")
         return 2
     print(f"Generated {len(artifact['answers'])} actual answers: {output}")
